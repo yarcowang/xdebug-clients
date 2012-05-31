@@ -1,0 +1,324 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import sys
+import socket
+import xml.parsers.expat
+import base64
+import signal
+
+from os.path import basename as basename
+
+########## ctrl+c ##########
+def quit(signum, frame):
+	sys.exit(0)
+signal.signal(signal.SIGINT, quit)
+
+########## color ##########
+colors = {
+	'colored' : {'red' : "\033[01;35m", 'green' : "\033[01;32m", 'blue' : "\033[01;34m", 'white' : "\033[01;37m", 'none' : "\033[00m"},
+	'noncolored' : {'red' : "", 'green' : "", 'blue' : "", 'white' : "", 'none' : ""}
+}
+
+color = 'colored'
+clear = 'clear'
+if sys.platform == 'win32':
+	color = 'noncolored'
+	clear = 'cls'
+	
+def red(s):
+	global colors, color
+	return colors[color]['red'] + s + colors[color]['none']
+
+def green(s):
+	global colors, color
+	return colors[color]['green'] + s + colors[color]['none']
+	
+def blue(s):
+	global colors, color
+	return colors[color]['blue'] + s + colors[color]['none']
+	
+def white(s):
+	global colors, color
+	return colors[color]['white'] + s + colors[color]['none']
+
+########## status ##########
+class Status:
+	curr_file = ''
+	curr_lineno = 1
+	buff = ''
+	max_depth = 2
+
+s = Status()
+
+########## output ##########
+class DataHandler:
+	def __init__(self):
+		self.mode = 'normal'
+		self.stack = []
+		self.level = 0
+		self.indent = []
+		self.scope = ''
+
+	def startEHandler(self, name, attr):
+		global s
+		
+		if name == 'init':
+			self.stack.append(self.mode)
+			self.level += 1
+			self.mode = 'init'
+			s.buff += white("connected.\n")
+			s.buff += white("current file is:\n")
+			s.buff += blue(" " + attr['fileuri'] + "\n")
+			s.curr_file = basename(attr['fileuri'])
+			s.curr_lineno = 1
+		elif name == 'response':
+			if attr['command'] == 'source':
+				self.stack.append(self.mode)
+				self.level += 1
+				self.mode = 'source'
+			elif attr['command'] == 'breakpoint_set':
+				s.buff += white("breakpoint : id = ") + blue(attr['id']) + "\n"
+			elif attr['command'] == 'breakpoint_list':
+				s.buff += white("breakpoint listing...\n")
+				s.buff += white("  id  lineno\n")
+			elif attr['command'] == 'run' or attr['command'] == 'step_into' or attr['command'] == 'step_over':
+				if attr['status'] == 'stopping':
+					s.buff += white("stopping\n")
+				else:
+					s.buff += white("break ")
+			elif attr['command'] == 'context_get':
+				s.buff += white("var listing...\n")
+		elif name == 'breakpoint':
+			s.buff += blue("  %s" % attr['id']) + (" %03d\n" % (int(attr['lineno'])))
+		elif name == 'property':
+			try:
+				attr['encoding']
+				self.stack.append(self.mode)
+				self.level += 1
+				self.mode = 'var_encoded'
+			except KeyError:
+				self.stack.append(self.mode)
+				self.level += 1
+				self.mode = 'var'
+			s.buff += ("  " * self.level) + "("
+			if attr['type'] == 'object':
+				s.buff += green(attr['classname'])
+			else:
+				s.buff += green(attr['type'])
+			s.buff += ")" + blue(attr['name']) + " = "
+			if (attr['type'] == 'array' or attr['type'] == 'object') and self.level < s.max_depth:
+				s.buff += "\n"
+				self.indent.append(self.level)
+		elif name == 'xdebug:message':
+			s.buff += white("at ")
+			try:
+				s.curr_file = basename(attr['filename'])
+				lineno = int(attr['lineno'])
+				if lineno > 4:
+					s.curr_lineno = lineno - 4
+				else:
+					s.curr_lineno = 1
+				s.buff += white(s.curr_file) + " "
+			except KeyError:
+				pass
+			s.buff += white("%03d\n" % int(attr['lineno']))
+		elif name == 'message':
+			self.stack.append(self.mode)
+			self.level += 1
+			self.mode = 'message'
+	
+	def charHandler(self, data):
+		global s
+		
+		if self.mode == 'init':
+			pass
+		elif self.mode == 'source':
+			d = base64.b64decode(data).split("\n")
+			i = s.curr_lineno - 10
+			for line in d:
+				s.buff += white("  %03d" % i) + (" %s\n" % line)
+				i += 1
+		elif self.mode == 'var':
+			s.buff += white("%s" % data)
+		elif self.mode == 'var_encoded':
+			s.buff += white("%s" % base64.b64decode(data))
+		elif self.mode == 'message':
+			s.buff = red(data) + "\n"
+		else:
+			s.buff += data
+			
+	def endEHandler(self, name):
+		if name == 'init':
+			self.mode = self.stack.pop()
+			self.level -= 1
+		elif name == 'response' and self.mode == 'source':
+			self.mode = self.stack.pop()
+			self.level -= 1
+		elif name == 'property':
+			self.mode = self.stack.pop()
+			self.level -= 1
+			if not self.indent:
+				s.buff += "\n"
+			else:
+				i = self.indent.pop()
+				if self.level != i - 1:
+					s.buff += "\n"
+					self.indent.append(i)
+		elif name == 'message':
+			self.mode = self.stack.pop()
+			self.level -= 1
+
+########## client ##########
+class TinyXDebugClient:
+	def __init__(self):
+		self.host = 'localhost'
+		self.port = 9000
+
+	def helpMe():
+		print '''This is a XDebug Client(TinyXDebugClient) by yarco which follow the gdb style.
+Make sure before you run this, the enviroment is ok for debuging. Something like:
+  1) you've already installed and enabled xdebug on your webservice
+  2) turn on the debug session which is described in XDebug document
+  (You could visit it online: http://www.xdebug.org/docs/remote)
+
+Supported options under command line:
+  -h  given this help
+  -s  keep silence
+
+Supported command when debuging:
+''',
+		TinyXDebugClient.helpDebug()
+	helpMe = staticmethod(helpMe)
+	
+	def helpDebug():
+		print '''  b  show breakpoints or set breakpoint(when given lineno)
+  c  clear the screen
+  h  given this help
+  l  show source(10 lines) or show source from lineno(when given lineno)
+  n  step over
+  ni step into
+  no step out
+  p  show current vars
+  q  exit debug mode
+  r  running
+  s  set features of the client(followed by name, value)
+     for example:
+       s max_depth 6
+     would show more informations contained in array than default settings
+'''
+	helpDebug = staticmethod(helpDebug)
+	
+	def start(self):
+		self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		self.s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		self.s.bind((self.host, self.port))
+		self.s.listen(5)
+
+		while True:
+			print 'Waiting for connection...'
+			(c, addr) = self.s.accept()
+
+			while True:
+				data = self.readData(c)
+				self.output(data)
+				while True:
+					data = self.parseCmd(raw_input(red('@') + green('%}') + white('> ')))
+					if data:
+						break
+				if data == 'quit':
+					c.close()
+					break
+				else:
+					c.send(data)
+      
+	def readData(self, c):
+		t = c.recv(10)
+		i = t.find("\0")
+		size = t[:i]
+		t = t + c.recv(int(size))
+		return t[i+1:-1]
+		
+	def output(self, data):
+		global s
+		#print data
+		p = xml.parsers.expat.ParserCreate()
+		o = DataHandler()
+		p.StartElementHandler = o.startEHandler
+		p.CharacterDataHandler = o.charHandler
+		p.EndElementHandler = o.endEHandler
+		p.Parse(data)
+		print s.buff
+		s.buff = ''
+
+	def parseCmd(self, cmd):
+		global s
+		ret = ''
+		cmd = cmd.strip(' ').split(' ')
+		if cmd[0] == 'l':
+			try:
+				fm = int(cmd[1])
+			except IndexError:
+				fm = s.curr_lineno
+			to = fm + 9
+			s.curr_lineno = to + 1
+			ret = "source -i 1 -f %s -b %d -e %d\0" % (s.curr_file, fm, to)
+		elif cmd[0] == 'b':
+			try:
+				lineno = int(cmd[1])
+				if lineno - 4 < 1:
+					s.curr_lineno = 1
+				else:
+					s.curr_lineno = lineno - 4
+				ret = "breakpoint_set -i 1 -t line -f %s -n %d\0" % (s.curr_file, lineno)
+			except IndexError:
+				ret = "breakpoint_list -i 1\0"
+		elif cmd[0] == 's':
+			try:
+				name = cmd[1]
+				value = cmd[2]
+				ret = "feature_set -i 1 -n %s -v %s\0" % (name, value)
+				s.max_depth = value
+			except IndexError:
+				print "Please use s <name> <value> to set features"
+		elif cmd[0] == 'p':
+			ret = "context_get -i 1\0"
+		elif cmd[0] == 'r':
+			ret = "run -i 1\0"
+		elif cmd[0] == 'n':
+			ret = "step_over -i 1\0"
+		elif cmd[0] == 'ni':
+			ret = "step_into -i 1\0"
+		elif cmd[0] == 'no':
+		  ret = "step_out -i 1\0"
+		elif cmd[0] == 'q':
+			ret = 'quit'
+		elif cmd[0] == 'h':
+			TinyXDebugClient.helpDebug()
+		elif cmd[0] == 'c':
+			import os
+			global clear
+			os.system(clear)
+		elif cmd[0] == "":
+			pass
+		else:
+			print 'Unkown command, use h to view help'
+
+		return ret
+
+if __name__ == '__main__':
+	if len(sys.argv) > 2:
+		TinyXDebugClient.helpMe()
+	else:
+		if len(sys.argv) == 2:
+			if sys.argv[1] == '-s':
+				o = TinyXDebugClient()
+				o.start()
+			else:
+				TinyXDebugClient.helpMe()
+		else:
+			print '''Welcome to Yarco's Tiny XDebug Client
+use Ctrl+C to quit, and h to get help when connected
+'''
+			o = TinyXDebugClient()
+			o.start()
